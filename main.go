@@ -27,7 +27,7 @@ func main() {
 		command = strings.Split(command[0], " ")
 	}
 
-	// Find toWatch in command that we will watch
+	// Find files in command that we will watch
 	toWatch := make([]string, 0)
 	for _, part := range command {
 		if part == "|" {
@@ -35,6 +35,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Usage: watch '<command>'")
 			os.Exit(1)
 		}
+
 		// We only care about files in the first command
 		if part == "&&" || part == "||" {
 			break
@@ -97,7 +98,7 @@ func main() {
 					return
 				}
 				if event.Has(fsnotify.Write) {
-					// Deduplicate; e.g. for 'gcc main.c && ./a.out' we'll get two events in the ~same time
+					// Deduplicate; e.g. for 'gcc main.c && ./a.out' we'll get two events at the ~same time
 					if time.Since(lastChange) < deduplicationDuration {
 						continue
 					}
@@ -121,7 +122,8 @@ func main() {
 		// Then rerun it on file changes
 		for {
 			select {
-			case <-fileChanges:
+			case fileChange := <-fileChanges:
+				fmt.Fprintf(os.Stderr, "--- Changed: %s\n", fileChange)
 				runCommand(ctx, command, fileChanges)
 			case <-ctx.Done():
 				return
@@ -140,7 +142,6 @@ func runCommand(ctx context.Context, command []string, fileChanges chan string) 
 	// Cancel and rerun the command if the file changes
 	go func() {
 		n := <-fileChanges
-		fmt.Fprintf(os.Stderr, "--- Changed: %s\n", n)
 		commandCancel()
 		fileChanges <- n
 	}()
