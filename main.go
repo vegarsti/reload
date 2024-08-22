@@ -158,7 +158,7 @@ func runCommand(ctx context.Context, command []string, fileChanges chan string) 
 			cmd := exec.CommandContext(commandCtx, command[index], command[index+1:i]...)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
-			err := cmd.Run() // We ignore the error, it's fine if the command fails!
+			err := cmd.Run()
 			if part == "&&" && err != nil {
 				break
 			}
@@ -171,7 +171,7 @@ func runCommand(ctx context.Context, command []string, fileChanges chan string) 
 	cmd := exec.CommandContext(commandCtx, command[index], command[index+1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err := cmd.Run() // We ignore the error, it's fine if the command fails!
+	err := cmd.Run()
 	if err != nil {
 		if errors.Unwrap(err) != nil {
 			fmt.Fprintln(os.Stderr, 1, err)
