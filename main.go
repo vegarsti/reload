@@ -124,6 +124,7 @@ func main() {
 			select {
 			case fileChange := <-fileChanges:
 				fmt.Fprintf(os.Stderr, "--- Changed: %s\n", fileChange)
+				fmt.Fprintf(os.Stderr, "--- Running: %s\n", strings.Join(command, " "))
 				runCommand(ctx, command, fileChanges)
 			case <-ctx.Done():
 				return
@@ -145,9 +146,6 @@ func runCommand(ctx context.Context, command []string, fileChanges chan string) 
 		commandCancel()
 		fileChanges <- n
 	}()
-
-	// Print the command we're running and some spacing
-	fmt.Fprintf(os.Stderr, "--- Running: %s\n", strings.Join(command, " "))
 
 	// Loop over the parts of the full command to possibly run parts separately,
 	// if there are control operators (&&, ||)
