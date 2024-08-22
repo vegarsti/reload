@@ -1,6 +1,6 @@
 # watch
 
-Add `watch` in front of your command to automatically rerun the command when related files change.
+Add `watch` in front of your command to automatically rerun the command when you make file changes.
 
 `watch` uses the following heuristics:
 
@@ -14,7 +14,7 @@ Add `watch` in front of your command to automatically rerun the command when rel
 ## Examples
 
 - `watch python3 main.py`
-- `watch gcc main.c && ./main`
+- `watch gcc main.c && ./a.out`
 - `watch make`
 
 ## Supported platforms
