@@ -157,10 +157,11 @@ func runCommands(ctx context.Context, commands []Command, fileChanges chan strin
 
 		err := cmd.Run()
 
-		// Handle error and possibly continue to next command
 		if (err == nil && command.operator == "||") || (err != nil && command.operator != "||") {
 			if errors.Unwrap(err) != nil {
-				fmt.Fprintln(os.Stderr, 1, err)
+				fmt.Fprintln(os.Stderr, errors.Unwrap(err))
+			} else {
+				fmt.Fprintln(os.Stderr, err)
 			}
 			return
 		}
