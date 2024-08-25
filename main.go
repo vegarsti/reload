@@ -119,8 +119,8 @@ func main() {
 	go func() {
 		defer wg.Done()
 
-		// First run the command
-		runCommand(ctx, commands, fileChanges)
+		// First run the command(s)
+		runCommands(ctx, commands, fileChanges)
 
 		// Then rerun it on file changes
 		for {
@@ -128,7 +128,7 @@ func main() {
 			case fileChange := <-fileChanges:
 				fmt.Fprintf(os.Stderr, "--- Changed: %s\n", fileChange)
 				fmt.Fprintf(os.Stderr, "--- Running: %s\n", strings.Join(input, " "))
-				runCommand(ctx, commands, fileChanges)
+				runCommands(ctx, commands, fileChanges)
 			case <-ctx.Done():
 				return
 			}
@@ -139,15 +139,15 @@ func main() {
 	wg.Wait()
 }
 
-func runCommand(ctx context.Context, commands []Command, fileChanges chan string) {
+func runCommands(ctx context.Context, commands []Command, fileChanges chan string) {
 	// Create child context so we can cancel this command without cancelling the entire program
 	commandCtx, commandCancel := context.WithCancel(ctx)
 
 	// Cancel and rerun the command if the file changes
 	go func() {
-		n := <-fileChanges
+		name := <-fileChanges
 		commandCancel()
-		fileChanges <- n
+		fileChanges <- name
 	}()
 
 	for _, command := range commands {
