@@ -6,7 +6,7 @@ Add `watch` in front of your command to automatically rerun the command when you
 
 `watch` uses the following heuristics:
 
-- If there is one or more files present in the command, it watches those files
+- If there are any files present in the command, it watches those files
 - If no files are present, it watches the whole current directory
 
 If you have a command pipeline, using `&&` or `||`, you'll need to quote the command.

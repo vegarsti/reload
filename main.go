@@ -20,27 +20,36 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Usage: watch <command>")
 		os.Exit(1)
 	}
-	command := os.Args[1:]
+	input := os.Args[1:]
 
 	// Heuristic: Split the command into parts if the full command is quoted
-	if len(command) == 1 && strings.Contains(command[0], " ") {
-		command = strings.Split(command[0], " ")
+	if len(input) == 1 && strings.Contains(input[0], " ") {
+		input = strings.Split(input[0], " ")
 	}
 
-	// Find files in command that we will watch
+	// Parse command:
+	// 1. Find files in command that we will watch
+	// 2. Split the command into parts that we can run separately
 	toWatch := make([]string, 0)
-	for _, part := range command {
+	commands := make([]Command, 0)
+	command := Command{}
+	for _, part := range input {
 		if part == "|" {
 			fmt.Fprintln(os.Stderr, "Error: watch does not support pipes")
 			fmt.Fprintln(os.Stderr, "Usage: watch '<command>'")
 			os.Exit(1)
 		}
 
-		// We only care about files in the first command
+		// Parse command
 		if part == "&&" || part == "||" {
-			break
+			command.operator = part
+			commands = append(commands, command)
+			command = Command{}
+			continue
 		}
+		command.parts = append(command.parts, part)
 
+		// Check if there's a file to watch
 		info, err := os.Stat(part)
 		if os.IsNotExist(err) {
 			continue
@@ -48,6 +57,7 @@ func main() {
 		check(err)
 		toWatch = append(toWatch, info.Name())
 	}
+	commands = append(commands, command)
 
 	// If there were no files in the command, watch all files in the current directory
 	if len(toWatch) == 0 {
@@ -59,14 +69,25 @@ func main() {
 	// Handle SIGTERM (CMD-C and the like)
 	s := make(chan os.Signal, 1)
 	signal.Notify(s, syscall.SIGINT, syscall.SIGTERM)
-	defer close(s)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
+	// Create a file watcher
 	watcher, err := fsnotify.NewWatcher()
 	check(err)
-	defer watcher.Close()
+
+	// Use this to synchronize the goroutines
+	var wg sync.WaitGroup
+
+	// Shut down when signal is received
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-s
+		close(s)
+		cancel()
+		watcher.Close()
+	}()
 
 	// Add files to watch
 	for _, file := range toWatch {
@@ -74,39 +95,21 @@ func main() {
 		check(err)
 	}
 
-	var wg sync.WaitGroup
-
-	// Cancel context when signal is received
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-s
-		cancel()
-	}()
-
-	// Start the file watcher
+	// Start the file watcher goroutine
 	fileChanges := make(chan string)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		lastChange := time.Now()
-		deduplicationDuration := 100 * time.Millisecond
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
+		dedupWindow := 100 * time.Millisecond
+		for event := range watcher.Events {
+			if event.Has(fsnotify.Write) {
+				// Treat multiple events at same time as one
+				if time.Since(lastChange) < dedupWindow {
+					continue
 				}
-				if event.Has(fsnotify.Write) {
-					// Deduplicate; e.g. for 'gcc main.c && ./a.out' we'll get two events at the ~same time
-					if time.Since(lastChange) < deduplicationDuration {
-						continue
-					}
-					lastChange = time.Now()
-					fileChanges <- event.Name
-				}
-			case <-ctx.Done():
-				return
+				lastChange = time.Now()
+				fileChanges <- event.Name
 			}
 		}
 	}()
@@ -117,15 +120,15 @@ func main() {
 		defer wg.Done()
 
 		// First run the command
-		runCommand(ctx, command, fileChanges)
+		runCommand(ctx, commands, fileChanges)
 
 		// Then rerun it on file changes
 		for {
 			select {
 			case fileChange := <-fileChanges:
 				fmt.Fprintf(os.Stderr, "--- Changed: %s\n", fileChange)
-				fmt.Fprintf(os.Stderr, "--- Running: %s\n", strings.Join(command, " "))
-				runCommand(ctx, command, fileChanges)
+				fmt.Fprintf(os.Stderr, "--- Running: %s\n", strings.Join(input, " "))
+				runCommand(ctx, commands, fileChanges)
 			case <-ctx.Done():
 				return
 			}
@@ -136,7 +139,7 @@ func main() {
 	wg.Wait()
 }
 
-func runCommand(ctx context.Context, command []string, fileChanges chan string) {
+func runCommand(ctx context.Context, commands []Command, fileChanges chan string) {
 	// Create child context so we can cancel this command without cancelling the entire program
 	commandCtx, commandCancel := context.WithCancel(ctx)
 
@@ -147,32 +150,19 @@ func runCommand(ctx context.Context, command []string, fileChanges chan string) 
 		fileChanges <- n
 	}()
 
-	// Loop over the parts of the full command to possibly run parts separately,
-	// if there are control operators (&&, ||)
-	index := 0
-	for i, part := range command {
-		// Handle control operators
-		if part == "&&" || part == "||" {
-			cmd := exec.CommandContext(commandCtx, command[index], command[index+1:i]...)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			err := cmd.Run()
-			if part == "&&" && err != nil {
-				break
+	for _, command := range commands {
+		cmd := exec.CommandContext(commandCtx, command.parts[0], command.parts[1:]...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		err := cmd.Run()
+
+		// Handle error and possibly continue to next command
+		if (err == nil && command.operator == "||") || (err != nil && command.operator != "||") {
+			if errors.Unwrap(err) != nil {
+				fmt.Fprintln(os.Stderr, 1, err)
 			}
-			if part == "||" && err == nil {
-				break
-			}
-			index = i + 1
-		}
-	}
-	cmd := exec.CommandContext(commandCtx, command[index], command[index+1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		if errors.Unwrap(err) != nil {
-			fmt.Fprintln(os.Stderr, 1, err)
+			return
 		}
 	}
 }
@@ -181,4 +171,9 @@ func check(err error) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+type Command struct {
+	parts    []string
+	operator string
 }
