@@ -15,9 +15,11 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+const name = "reload"
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: watch <command>")
+		fmt.Fprintf(os.Stderr, "Usage: %s <command>\n", name)
 		os.Exit(1)
 	}
 	input := os.Args[1:]
@@ -35,8 +37,8 @@ func main() {
 	command := Command{}
 	for _, part := range input {
 		if part == "|" {
-			fmt.Fprintln(os.Stderr, "Error: watch does not support pipes")
-			fmt.Fprintln(os.Stderr, "Usage: watch '<command>'")
+			fmt.Fprintf(os.Stderr, "Error: %s does not support pipes\n", name)
+			fmt.Fprintf(os.Stderr, "Usage: %s '<command>'\n", name)
 			os.Exit(1)
 		}
 
