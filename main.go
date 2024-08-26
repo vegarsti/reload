@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,44 +24,27 @@ func main() {
 	}
 	input := os.Args[1:]
 
-	// Heuristic: Split the command into parts if the full command is quoted
+	// Split the command into parts if the full command is quoted
 	if len(input) == 1 && strings.Contains(input[0], " ") {
 		input = strings.Split(input[0], " ")
 	}
+	command := strings.Join(input, " ")
 
-	// Parse command:
-	// 1. Find files in command that we will watch
-	// 2. Split the command into parts that we can run separately
+	// Find files in command that we will watch
 	toWatch := make([]string, 0)
-	commands := make([]Command, 0)
-	command := Command{}
 	for _, part := range input {
-		if part == "|" {
-			fmt.Fprintf(os.Stderr, "Error: %s does not support pipes\n", name)
-			fmt.Fprintf(os.Stderr, "Usage: %s '<command>'\n", name)
-			os.Exit(1)
-		}
-
-		// Parse command
-		if part == "&&" || part == "||" {
-			command.operator = part
-			commands = append(commands, command)
-			command = Command{}
-			continue
-		}
-		command.parts = append(command.parts, part)
-
 		// Check if there's a file to watch
 		info, err := os.Stat(part)
 		if os.IsNotExist(err) {
 			continue
 		}
 		check(err)
-		toWatch = append(toWatch, info.Name())
+		if !slices.Contains(toWatch, info.Name()) {
+			toWatch = append(toWatch, info.Name())
+		}
 	}
-	commands = append(commands, command)
 
-	// If there were no files in the command, watch all files in the current directory
+	// Fall back to watching the working directory
 	if len(toWatch) == 0 {
 		wd, err := os.Getwd()
 		check(err)
@@ -75,6 +58,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create a file watcher
+	fileChanges := make(chan string, 2)
 	watcher, err := fsnotify.NewWatcher()
 	check(err)
 
@@ -86,9 +70,10 @@ func main() {
 	go func() {
 		defer wg.Done()
 		<-s
-		close(s)
 		cancel()
-		watcher.Close()
+		close(s)
+		close(fileChanges)
+		_ = watcher.Close()
 	}()
 
 	// Add files to watch
@@ -98,85 +83,76 @@ func main() {
 	}
 
 	// Start the file watcher goroutine
-	fileChanges := make(chan string)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		lastChange := time.Now()
 		dedupWindow := 100 * time.Millisecond
-		for event := range watcher.Events {
-			if event.Has(fsnotify.Write) {
-				// Treat multiple events at same time as one
-				if time.Since(lastChange) < dedupWindow {
-					continue
-				}
-				lastChange = time.Now()
-				fileChanges <- event.Name
-			}
-		}
-	}()
-
-	// Run the command
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		// First run the command(s)
-		runCommands(ctx, commands, fileChanges)
-
-		// Then rerun it on file changes
 		for {
 			select {
-			case fileChange := <-fileChanges:
-				fmt.Fprintf(os.Stderr, "--- Changed: %s\n", fileChange)
-				fmt.Fprintf(os.Stderr, "--- Running: %s\n", strings.Join(input, " "))
-				runCommands(ctx, commands, fileChanges)
 			case <-ctx.Done():
 				return
+			case event := <-watcher.Events:
+				if event.Has(fsnotify.Write) {
+					// Treat multiple events at same time as one
+					if time.Since(lastChange) < dedupWindow {
+						continue
+					}
+					lastChange = time.Now()
+					fileChanges <- event.Name
+				}
 			}
 		}
-
 	}()
 
+	// First run the command
+	runCommand(ctx, command, fileChanges)
+
+	// Then rerun it on file changes
+	for name := range fileChanges {
+		fmt.Fprintf(os.Stderr, "--- Changed: %s\n", name)
+		fmt.Fprintf(os.Stderr, "--- Running: %s\n", command)
+		runCommand(ctx, command, fileChanges)
+	}
+
+	// Wait until all goroutines are done
 	wg.Wait()
 }
 
-func runCommands(ctx context.Context, commands []Command, fileChanges chan string) {
-	// Create child context so we can cancel this command without cancelling the entire program
+func runCommand(ctx context.Context, command string, fileChanges chan string) {
+	// Create child context so we can cancel this command
+	// without cancelling the entire program
 	commandCtx, commandCancel := context.WithCancel(ctx)
+	defer commandCancel()
 
 	// Cancel and rerun the command if the file changes
+	// while we run the command
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		name := <-fileChanges
+		defer wg.Done()
+		name, ok := <-fileChanges
+		// The channel was closed, shut down
+		if !ok {
+			return
+		}
 		commandCancel()
+		// Send the file change back on the channel
+		// to trigger `runCommand` again
 		fileChanges <- name
 	}()
 
-	for _, command := range commands {
-		cmd := exec.CommandContext(commandCtx, command.parts[0], command.parts[1:]...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		err := cmd.Run()
-
-		if (err == nil && command.operator == "||") || (err != nil && command.operator != "||") {
-			if errors.Unwrap(err) != nil {
-				fmt.Fprintln(os.Stderr, errors.Unwrap(err))
-			} else {
-				fmt.Fprintln(os.Stderr, err)
-			}
-			return
-		}
-	}
+	// Run the command using `sh -c <command>` to allow for
+	// shell syntax such as pipes and boolean operators
+	cmd := exec.CommandContext(commandCtx, "sh", []string{"-c", command}...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	_ = cmd.Run() // It's fine if the command fails!
+	wg.Wait()
 }
 
 func check(err error) {
 	if err != nil {
 		panic(err)
 	}
-}
-
-type Command struct {
-	parts    []string
-	operator string
 }

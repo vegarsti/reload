@@ -2,8 +2,6 @@
 
 Add `reload` in front of your command to automatically rerun the command when you make file changes.
 
-![CleanShot 2024-08-25 at 07 30 18](https://github.com/user-attachments/assets/1f5c8f70-c485-4982-a503-4e0ba391f0ea)
-
 `reload` uses the following heuristics:
 
 - If there are any files present in the command, it watches those files
