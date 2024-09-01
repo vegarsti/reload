@@ -1,4 +1,4 @@
-module github.com/vegarsti/watch
+module github.com/vegarsti/reload
 
 go 1.23.0
 
