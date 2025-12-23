@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -76,9 +77,9 @@ func main() {
 		_ = watcher.Close()
 	}()
 
-	// Add files to watch
+	// Add files to watch (recursively for directories)
 	for _, file := range toWatch {
-		err = watcher.Add(file)
+		err = addWatchRecursive(watcher, file)
 		check(err)
 	}
 
@@ -155,4 +156,31 @@ func check(err error) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+// addWatchRecursive adds a path to the watcher. If the path is a directory,
+// it recursively adds all subdirectories as well.
+func addWatchRecursive(watcher *fsnotify.Watcher, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	// If it's not a directory, just add it directly
+	if !info.IsDir() {
+		return watcher.Add(path)
+	}
+
+	// Walk the directory tree and add all directories
+	return filepath.WalkDir(path, func(walkPath string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if err := watcher.Add(walkPath); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
