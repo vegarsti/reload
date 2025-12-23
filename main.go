@@ -21,6 +21,14 @@ const name = "reload"
 const dedupWindow = 100 * time.Millisecond
 
 func main() {
+	// Check for help flags
+	for _, arg := range os.Args[1:] {
+		if arg == "-h" || arg == "--help" || arg == "-help" {
+			printHelp()
+			os.Exit(0)
+		}
+	}
+
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: %s <command>\n", name)
 		os.Exit(1)
@@ -181,6 +189,26 @@ func check(err error) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func printHelp() {
+	fmt.Printf(`%s - automatically rerun commands when files change
+
+Usage: %s <command>
+
+Examples:
+  %s python3 main.py
+  %s 'gcc main.c && ./a.out'
+  %s make
+
+%s uses the following heuristics:
+- If there are any files present in the command, it watches those files
+- If no files are present, it watches the whole current directory
+
+Options:
+  -h, --help    Show this help message
+
+`, name, name, name, name, name, name)
 }
 
 // addWatchRecursive adds a path to the watcher. If the path is a directory,
