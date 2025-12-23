@@ -18,6 +18,8 @@ import (
 
 const name = "reload"
 
+const dedupWindow = 100 * time.Millisecond
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: %s <command>\n", name)
@@ -88,7 +90,6 @@ func main() {
 	go func() {
 		defer wg.Done()
 		lastChange := time.Now()
-		dedupWindow := 100 * time.Millisecond
 		for {
 			select {
 			case <-ctx.Done():
@@ -138,6 +139,7 @@ func runCommand(ctx context.Context, command string, fileChanges chan string) {
 			return
 		}
 		commandCancel()
+		time.Sleep(100 * time.Millisecond)
 		// Send the file change back on the channel
 		// to trigger `runCommand` again
 		fileChanges <- name
@@ -148,7 +150,30 @@ func runCommand(ctx context.Context, command string, fileChanges chan string) {
 	cmd := exec.CommandContext(commandCtx, "sh", []string{"-c", command}...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	_ = cmd.Run() // It's fine if the command fails!
+
+	// Set process group so we can kill all child processes
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return
+	}
+
+	// Wait for completion in a goroutine
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	// Wait for either completion or cancellation
+	select {
+	case <-commandCtx.Done():
+		// Kill the entire process group (negative PID)
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-done // Wait for process to actually exit
+	case <-done:
+		// Command completed normally
+	}
 	wg.Wait()
 }
 
