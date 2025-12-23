@@ -147,7 +147,6 @@ func runCommand(ctx context.Context, command string, fileChanges chan string) {
 			return
 		}
 		commandCancel()
-		time.Sleep(100 * time.Millisecond)
 		// Send the file change back on the channel
 		// to trigger `runCommand` again
 		fileChanges <- name
