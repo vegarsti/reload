@@ -229,6 +229,10 @@ func addWatchRecursive(watcher *fsnotify.Watcher, path string) error {
 			return err
 		}
 		if d.IsDir() {
+			// Skip .git directory
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
 			if err := watcher.Add(walkPath); err != nil {
 				return err
 			}
