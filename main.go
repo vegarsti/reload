@@ -116,39 +116,41 @@ func main() {
 	}()
 
 	// First run the command
-	changedFile := runCommand(ctx, command, fileChanges)
+	runCommand(ctx, command, fileChanges)
 
 	// Then rerun it on file changes
-	for {
-		// Check if we got a changed file from runCommand, otherwise wait for one
-		var name string
-		if changedFile != "" {
-			name = changedFile
-			changedFile = ""
-		} else {
-			var ok bool
-			name, ok = <-fileChanges
-			if !ok {
-				break
-			}
-		}
+	for name := range fileChanges {
 		fmt.Fprintf(os.Stderr, "--- Changed: %s\n", name)
 		fmt.Fprintf(os.Stderr, "--- Running: %s\n", command)
-		changedFile = runCommand(ctx, command, fileChanges)
+		runCommand(ctx, command, fileChanges)
 	}
 
 	// Wait until all goroutines are done
 	wg.Wait()
 }
 
-// runCommand runs a command and returns the name of the file that changed
-// if the command was interrupted by a file change, or an empty string if
-// the command completed normally or the context was cancelled.
-func runCommand(ctx context.Context, command string, fileChanges chan string) string {
+func runCommand(ctx context.Context, command string, fileChanges chan string) {
 	// Create child context so we can cancel this command
 	// without cancelling the entire program
 	commandCtx, commandCancel := context.WithCancel(ctx)
 	defer commandCancel()
+
+	// Cancel and rerun the command if the file changes
+	// while we run the command
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		name, ok := <-fileChanges
+		// The channel was closed, shut down
+		if !ok {
+			return
+		}
+		commandCancel()
+		// Send the file change back on the channel
+		// to trigger `runCommand` again
+		fileChanges <- name
+	}()
 
 	// Run the command using `sh -c <command>` to allow for
 	// shell syntax such as pipes and boolean operators
@@ -156,14 +158,12 @@ func runCommand(ctx context.Context, command string, fileChanges chan string) st
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// Set process group so we can kill all child processes.
-	// This makes the spawned process the leader of a new process group,
-	// allowing us to kill it and all its descendants with a single signal.
+	// Set process group so we can kill all child processes
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// Start the command
 	if err := cmd.Start(); err != nil {
-		return ""
+		return
 	}
 
 	// Wait for completion in a goroutine
@@ -172,34 +172,16 @@ func runCommand(ctx context.Context, command string, fileChanges chan string) st
 		done <- cmd.Wait()
 	}()
 
-	// killProcessGroup sends SIGKILL to the entire process group
-	killProcessGroup := func() {
-		pgid, err := syscall.Getpgid(cmd.Process.Pid)
-		if err != nil {
-			// Fallback to just killing the main process
-			_ = cmd.Process.Kill()
-			return
-		}
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	}
-
-	// Wait for either completion, cancellation, or file change
+	// Wait for either completion or cancellation
 	select {
 	case <-commandCtx.Done():
-		killProcessGroup()
+		// Kill the entire process group (negative PID)
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		<-done // Wait for process to actually exit
-		return ""
 	case <-done:
 		// Command completed normally
-		return ""
-	case name, ok := <-fileChanges:
-		if !ok {
-			return ""
-		}
-		killProcessGroup()
-		<-done // Wait for process to actually exit
-		return name
 	}
+	wg.Wait()
 }
 
 func check(err error) {
