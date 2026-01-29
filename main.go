@@ -20,6 +20,9 @@ const name = "reload"
 
 const dedupWindow = 100 * time.Millisecond
 
+// Global ignore patterns (.git is always ignored)
+var ignorePatterns = []string{".git"}
+
 func main() {
 	// Check for help flags
 	for _, arg := range os.Args[1:] {
@@ -33,7 +36,33 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: %s <command>\n", name)
 		os.Exit(1)
 	}
-	input := os.Args[1:]
+
+	// Parse --ignore flags and separate them from the command
+	var input []string
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--ignore" || args[i] == "-i" {
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "Error: %s requires a pattern argument\n", args[i])
+				os.Exit(1)
+			}
+			ignorePatterns = append(ignorePatterns, args[i+1])
+			i++ // Skip the pattern argument
+		} else if strings.HasPrefix(args[i], "--ignore=") {
+			pattern := strings.TrimPrefix(args[i], "--ignore=")
+			ignorePatterns = append(ignorePatterns, pattern)
+		} else if strings.HasPrefix(args[i], "-i=") {
+			pattern := strings.TrimPrefix(args[i], "-i=")
+			ignorePatterns = append(ignorePatterns, pattern)
+		} else {
+			input = append(input, args[i])
+		}
+	}
+
+	if len(input) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: %s <command>\n", name)
+		os.Exit(1)
+	}
 
 	// Split the command into parts if the full command is quoted
 	if len(input) == 1 && strings.Contains(input[0], " ") {
@@ -104,6 +133,10 @@ func main() {
 				return
 			case event := <-watcher.Events:
 				if event.Has(fsnotify.Write) {
+					// Check if the file should be ignored
+					if shouldIgnore(event.Name) {
+						continue
+					}
 					// Treat multiple events at same time as one
 					if time.Since(lastChange) < dedupWindow {
 						continue
@@ -190,24 +223,56 @@ func check(err error) {
 	}
 }
 
+// shouldIgnore checks if a path should be ignored based on ignore patterns.
+// It matches against both the full path and the base name.
+func shouldIgnore(path string) bool {
+	for _, pattern := range ignorePatterns {
+		// Try matching the full path
+		if matched, _ := filepath.Match(pattern, path); matched {
+			return true
+		}
+		// Try matching the base name
+		if matched, _ := filepath.Match(pattern, filepath.Base(path)); matched {
+			return true
+		}
+		// Try matching if the pattern is a prefix (for directory paths like "public")
+		if strings.HasPrefix(path, pattern+string(filepath.Separator)) || path == pattern {
+			return true
+		}
+		// Check if any path component matches the pattern
+		parts := strings.Split(path, string(filepath.Separator))
+		for _, part := range parts {
+			if matched, _ := filepath.Match(pattern, part); matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func printHelp() {
 	fmt.Printf(`%s - automatically rerun commands when files change
 
-Usage: %s <command>
+Usage: %s [options] <command>
 
 Examples:
   %s python3 main.py
   %s 'gcc main.c && ./a.out'
   %s make
+  %s --ignore public --ignore node_modules make
+  %s -i "*.log" -i dist 'npm run build'
 
 %s uses the following heuristics:
 - If there are any files present in the command, it watches those files
 - If no files are present, it watches the whole current directory
 
 Options:
-  -h, --help    Show this help message
+  -i, --ignore <pattern>  Ignore files/directories matching the pattern.
+                          Can be specified multiple times.
+                          Supports glob patterns (e.g., "*.log", "build/*").
+  -h, --help              Show this help message
 
-`, name, name, name, name, name, name)
+`, name, name, name, name, name, name, name, name)
 }
 
 // addWatchRecursive adds a path to the watcher. If the path is a directory,
@@ -229,8 +294,7 @@ func addWatchRecursive(watcher *fsnotify.Watcher, path string) error {
 			return err
 		}
 		if d.IsDir() {
-			// Skip .git directory
-			if d.Name() == ".git" {
+			if shouldIgnore(walkPath) {
 				return filepath.SkipDir
 			}
 			if err := watcher.Add(walkPath); err != nil {
