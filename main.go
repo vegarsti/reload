@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
+	"golang.org/x/sys/unix"
 )
 
 const name = "reload"
@@ -22,6 +22,108 @@ const dedupWindow = 100 * time.Millisecond
 
 // Global ignore patterns (.git is always ignored)
 var ignorePatterns = []string{".git"}
+
+// kqueueWatcher watches directories using kqueue (macOS/BSD)
+type kqueueWatcher struct {
+	kq      int            // kqueue file descriptor
+	fds     map[string]int // path -> file descriptor mapping
+	fdPaths map[int]string // file descriptor -> path mapping (reverse lookup)
+	mu      sync.Mutex
+}
+
+func newKqueueWatcher() (*kqueueWatcher, error) {
+	kq, err := unix.Kqueue()
+	if err != nil {
+		return nil, err
+	}
+	// Set close-on-exec flag so child processes don't inherit the kqueue fd
+	unix.CloseOnExec(kq)
+	return &kqueueWatcher{
+		kq:      kq,
+		fds:     make(map[string]int),
+		fdPaths: make(map[int]string),
+	}, nil
+}
+
+func (w *kqueueWatcher) Add(path string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Skip if already watching
+	if _, exists := w.fds[path]; exists {
+		return nil
+	}
+
+	fd, fflags, err := openForKqueue(path)
+	if err != nil {
+		return err
+	}
+
+	w.fds[path] = fd
+	w.fdPaths[fd] = path
+
+	// Register for vnode events
+	_, err = unix.Kevent(w.kq, []unix.Kevent_t{{
+		Ident:  uint64(fd),
+		Filter: unix.EVFILT_VNODE,
+		Flags:  unix.EV_ADD | unix.EV_CLEAR | unix.EV_ENABLE,
+		Fflags: fflags,
+	}}, nil, nil)
+	if err != nil {
+		unix.Close(fd)
+		delete(w.fds, path)
+		delete(w.fdPaths, fd)
+		return err
+	}
+	return nil
+}
+
+// openForKqueue opens a path for kqueue watching and returns the fd and appropriate fflags.
+func openForKqueue(path string) (fd int, fflags uint32, err error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if info.IsDir() {
+		fd, err = unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		fflags = unix.NOTE_WRITE // fires when files are created, deleted, or renamed
+	} else {
+		fd, err = unix.Open(path, unix.O_RDONLY|unix.O_EVTONLY|unix.O_CLOEXEC, 0)
+		fflags = unix.NOTE_DELETE | unix.NOTE_WRITE | unix.NOTE_EXTEND | unix.NOTE_ATTRIB | unix.NOTE_LINK | unix.NOTE_RENAME | unix.NOTE_REVOKE
+	}
+	return fd, fflags, err
+}
+
+func (w *kqueueWatcher) Wait() (string, error) {
+	events := make([]unix.Kevent_t, 1)
+	for {
+		n, err := unix.Kevent(w.kq, nil, events, nil)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			return "", err
+		}
+		if n > 0 {
+			w.mu.Lock()
+			path, ok := w.fdPaths[int(events[0].Ident)]
+			w.mu.Unlock()
+			if ok {
+				return path, nil
+			}
+		}
+	}
+}
+
+func (w *kqueueWatcher) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, fd := range w.fds {
+		unix.Close(fd)
+	}
+	return unix.Close(w.kq)
+}
 
 func main() {
 	// Check for help flags
@@ -74,13 +176,16 @@ func main() {
 	toWatch := make([]string, 0)
 	for _, part := range input {
 		// Check if there's a file to watch
-		info, err := os.Stat(part)
+		_, err := os.Stat(part)
 		if os.IsNotExist(err) {
 			continue
 		}
 		check(err)
-		if !slices.Contains(toWatch, info.Name()) {
-			toWatch = append(toWatch, info.Name())
+		// Convert to absolute path for reliable watching
+		absPath, err := filepath.Abs(part)
+		check(err)
+		if !slices.Contains(toWatch, absPath) {
+			toWatch = append(toWatch, absPath)
 		}
 	}
 
@@ -99,7 +204,7 @@ func main() {
 
 	// Create a file watcher
 	fileChanges := make(chan string, 2)
-	watcher, err := fsnotify.NewWatcher()
+	watcher, err := newKqueueWatcher()
 	check(err)
 
 	// Use this to synchronize the goroutines
@@ -116,7 +221,7 @@ func main() {
 		_ = watcher.Close()
 	}()
 
-	// Add files to watch (recursively for directories)
+	// Add directories to watch (kqueue watches directories for file changes)
 	for _, file := range toWatch {
 		err = addWatchRecursive(watcher, file)
 		check(err)
@@ -131,19 +236,21 @@ func main() {
 			select {
 			case <-ctx.Done():
 				return
-			case event := <-watcher.Events:
-				if event.Has(fsnotify.Write) {
-					// Check if the file should be ignored
-					if shouldIgnore(event.Name) {
-						continue
-					}
-					// Treat multiple events at same time as one
-					if time.Since(lastChange) < dedupWindow {
-						continue
-					}
-					lastChange = time.Now()
-					fileChanges <- event.Name
+			default:
+				path, err := watcher.Wait()
+				if err != nil {
+					return
 				}
+				// Check if the file should be ignored
+				if shouldIgnore(path) {
+					continue
+				}
+				// Treat multiple events at same time as one
+				if time.Since(lastChange) < dedupWindow {
+					continue
+				}
+				lastChange = time.Now()
+				fileChanges <- path
 			}
 		}
 	}()
@@ -276,19 +383,19 @@ Options:
 }
 
 // addWatchRecursive adds a path to the watcher. If the path is a directory,
-// it recursively adds all subdirectories as well.
-func addWatchRecursive(watcher *fsnotify.Watcher, path string) error {
+// it recursively adds all subdirectories and files.
+func addWatchRecursive(watcher *kqueueWatcher, path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
 
-	// If it's not a directory, just add it directly
+	// If it's a file, just watch it directly
 	if !info.IsDir() {
 		return watcher.Add(path)
 	}
 
-	// Walk the directory tree and add all directories
+	// Walk the directory tree and add all directories and files
 	return filepath.WalkDir(path, func(walkPath string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -297,9 +404,9 @@ func addWatchRecursive(watcher *fsnotify.Watcher, path string) error {
 			if shouldIgnore(walkPath) {
 				return filepath.SkipDir
 			}
-			if err := watcher.Add(walkPath); err != nil {
-				return err
-			}
+		}
+		if err := watcher.Add(walkPath); err != nil {
+			return err
 		}
 		return nil
 	})
