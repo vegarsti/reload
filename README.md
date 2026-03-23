@@ -21,4 +21,4 @@ If you have a command pipeline, using `&&` or `||`, you'll need to quote the com
 
 ## Supported platforms
 
-`reload` uses the [fsnotify](https://github.com/fsnotify/fsnotify) cross-platform filesystem notification library which supports macOS, Windows, Linux, and others.
+`reload` uses kqueue which only works on macOS or other BSD platforms, and has only been tested on a Mac.
