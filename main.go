@@ -13,15 +13,135 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
+	"golang.org/x/sys/unix"
 )
 
 const name = "reload"
-
 const dedupWindow = 100 * time.Millisecond
 
 // Global ignore patterns (.git is always ignored)
 var ignorePatterns = []string{".git"}
+
+type watcher struct {
+	kq      int            // kqueue file descriptor
+	fds     map[string]int // path -> file descriptor mapping
+	fdPaths map[int]string // file descriptor -> path mapping (reverse lookup)
+}
+
+func newWatcher() (*watcher, error) {
+	kq, err := unix.Kqueue()
+	if err != nil {
+		return nil, err
+	}
+	// Set close-on-exec flag so child processes don't inherit the kqueue fd
+	unix.CloseOnExec(kq)
+	return &watcher{
+		kq:      kq,
+		fds:     make(map[string]int),
+		fdPaths: make(map[int]string),
+	}, nil
+}
+
+func (w *watcher) Add(path string) error {
+	// Skip if already watching
+	if _, exists := w.fds[path]; exists {
+		return nil
+	}
+
+	// Open file with event-only flag to only get events,
+	// and close on exec, so that exec'ing the command to reload
+	// does not copy the file descriptors.
+	fd, err := unix.Open(path, unix.O_EVTONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+
+	// Register file/directory
+	w.fds[path] = fd
+	w.fdPaths[fd] = path
+	_, err = unix.Kevent(
+		w.kq,
+		// changes to look for
+		[]unix.Kevent_t{{
+			Ident:  uint64(fd),
+			Filter: unix.EVFILT_VNODE,
+			Flags:  unix.EV_ADD | unix.EV_CLEAR,
+			Fflags: uint32(unix.NOTE_WRITE),
+		}},
+		nil, // events to populate: none here
+		nil, // no timeout; not populating events anyway
+	)
+	if err != nil {
+		unix.Close(fd)
+		return err
+	}
+	return nil
+}
+
+func (w *watcher) addRecursive(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	// If it's a file, just watch it directly
+	if !info.IsDir() {
+		return w.Add(path)
+	}
+
+	// Walk the directory tree and add all directories and files
+	return filepath.WalkDir(path, func(walkPath string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if shouldIgnore(walkPath) {
+				// SkipDir is used as a return value from WalkFunc
+				// to indicate that the directory named in the call
+				// is to be skipped.
+				return filepath.SkipDir
+			}
+		}
+		// Watch the directory for new files and deletions
+		err = w.Add(walkPath)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// Wait until any file changes, and return the filename of the changed file
+func (w *watcher) Wait() (string, error) {
+	events := make([]unix.Kevent_t, 1)
+	for {
+		n, err := unix.Kevent(
+			w.kq,   // the queue
+			nil,    // changes
+			events, // events to populate
+			nil,    // no timeout
+		)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			return "", err
+		}
+		if n > 0 {
+			path, ok := w.fdPaths[int(events[0].Ident)]
+			if ok {
+				return path, nil
+			}
+		}
+	}
+}
+
+func (w *watcher) Close() error {
+	for _, fd := range w.fds {
+		unix.Close(fd)
+	}
+	return unix.Close(w.kq)
+}
 
 func main() {
 	// Check for help flags
@@ -74,13 +194,16 @@ func main() {
 	toWatch := make([]string, 0)
 	for _, part := range input {
 		// Check if there's a file to watch
-		info, err := os.Stat(part)
+		_, err := os.Stat(part)
 		if os.IsNotExist(err) {
 			continue
 		}
 		check(err)
-		if !slices.Contains(toWatch, info.Name()) {
-			toWatch = append(toWatch, info.Name())
+		// Convert to absolute path for reliable watching
+		absPath, err := filepath.Abs(part)
+		check(err)
+		if !slices.Contains(toWatch, absPath) {
+			toWatch = append(toWatch, absPath)
 		}
 	}
 
@@ -99,7 +222,7 @@ func main() {
 
 	// Create a file watcher
 	fileChanges := make(chan string, 2)
-	watcher, err := fsnotify.NewWatcher()
+	watcher, err := newWatcher()
 	check(err)
 
 	// Use this to synchronize the goroutines
@@ -116,9 +239,9 @@ func main() {
 		_ = watcher.Close()
 	}()
 
-	// Add files to watch (recursively for directories)
+	// Add directories to watch (kqueue watches directories for file changes)
 	for _, file := range toWatch {
-		err = addWatchRecursive(watcher, file)
+		err = watcher.addRecursive(file)
 		check(err)
 	}
 
@@ -131,19 +254,28 @@ func main() {
 			select {
 			case <-ctx.Done():
 				return
-			case event := <-watcher.Events:
-				if event.Has(fsnotify.Write) {
-					// Check if the file should be ignored
-					if shouldIgnore(event.Name) {
-						continue
-					}
-					// Treat multiple events at same time as one
-					if time.Since(lastChange) < dedupWindow {
-						continue
-					}
-					lastChange = time.Now()
-					fileChanges <- event.Name
+			default:
+				path, err := watcher.Wait()
+				if err != nil {
+					return
 				}
+				// Check if the file should be ignored
+				if shouldIgnore(path) {
+					continue
+				}
+				// If the file event was from a directory, it may have
+				// created a new file. If so, we need to add it!
+				info, _ := os.Stat(path)
+				if info != nil && info.IsDir() {
+					// Re-walk to pick up new files
+					watcher.addRecursive(path)
+				}
+				// Treat multiple events at same time as one
+				if time.Since(lastChange) < dedupWindow {
+					continue
+				}
+				lastChange = time.Now()
+				fileChanges <- path
 			}
 		}
 	}()
@@ -273,34 +405,4 @@ Options:
   -h, --help              Show this help message
 
 `, name, name, name, name, name, name, name, name)
-}
-
-// addWatchRecursive adds a path to the watcher. If the path is a directory,
-// it recursively adds all subdirectories as well.
-func addWatchRecursive(watcher *fsnotify.Watcher, path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-
-	// If it's not a directory, just add it directly
-	if !info.IsDir() {
-		return watcher.Add(path)
-	}
-
-	// Walk the directory tree and add all directories
-	return filepath.WalkDir(path, func(walkPath string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if shouldIgnore(walkPath) {
-				return filepath.SkipDir
-			}
-			if err := watcher.Add(walkPath); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
 }
